@@ -3,10 +3,14 @@
 namespace LibBER;
 
 use LibASN1\Type,
+    LibASN1\Null,
     LibASN1\Boolean,
     LibASN1\Integer,
+    LibASN1\Real,
     LibASN1\OctetString,
-    LibASN1\Null;
+    LibASN1\Collection,
+    LibASN1\Sequence,
+    LibASN1\Set;
 
 class Encoder
 {
@@ -117,16 +121,41 @@ class Encoder
         return $this->encodeIdentifier($data->getClass(), $data->isConstructed(), $data->getNumber());
     }
 
-    private function output($data, OutputStream $outputStream = null, &$result = null)
+    private function encodeCollection(Collection $data, OutputStream $outputStream = null)
     {
-        if ($outputStream !== null && !$this->options[self::OPT_FORCE_DEFINITE_LENGTH]) {
-            $outputStream->write($result . $data);
-            $result = null;
-        } else {
-            $result .= $data;
-        }
+        if ($outputStream && !$this->options[self::OPT_FORCE_DEFINITE_LENGTH]) {
+            $outputStream->write($this->encodeIdentifierFromType($data) . "\x80");
 
-        return $result;
+            foreach ($data as $component) {
+                if ($component !== null) {
+                    $this->encode($component, $outputStream);
+                }
+            }
+
+            $outputStream->write("\x00\x00");
+        } else {
+            $raw = '';
+            foreach ($data as $component) {
+                if ($component !== null) {
+                    $raw .= $this->encode($component);
+                }
+            }
+
+            $result = $this->encodeIdentifier($data->getClass(), false, $data->getNumber());
+                    . $this->encodeDefiniteLength(strlen($raw))
+                    . $raw;
+
+            return $this->output($result, $outputStream);
+        }
+    }
+
+    private function output($data, OutputStream $outputStream = null)
+    {
+        if ($outputStream) {
+            $outputStream->write($data);
+        } else {
+            return $data;
+        }
     }
 
     public function __construct(array $options = [])
@@ -162,88 +191,101 @@ class Encoder
     public function encode(Type $data, OutputStream $outputStream = null)
     {
         switch (true) {
+            case $data instanceof Null:
+                return $this->encodeNull($data, $outputStream);
+
             case $data instanceof Boolean:
                 return $this->encodeBoolean($data, $outputStream);
 
             case $data instanceof Integer:
-            case $data instanceof Enumeration:
                 return $this->encodeInteger($data, $outputStream);
+
+            case $data instanceof Real:
+                return $this->encodeReal($data, $outputStream);
 
             case $data instanceof OctetString:
                 return $this->encodeOctetString($data, $outputStream);
 
-            case $data instanceof Null:
-                return $this->encodeNull($data, $outputStream);
-
-            case $data instanceof Sequence:
-                return $this->encodeSequence($data, $outputStream);
+            case $data instanceof Collection:
+                return $this->encodeCollection($data, $outputStream);
         }
     }
 
     public function encodeBoolean(Boolean $data, OutputStream $outputStream = null)
     {
-        return $this->output(
-            $this->encodeIdentifierFromType($data) . "\x01" . chr($data->getValue() ? $this->options[self::OPT_TRUE_VALUE] : 0),
-            $outputStream
-        );
+        $result = $this->encodeIdentifierFromType($data)
+                . "\x01"
+                . chr($data->getValue() ? $this->options[self::OPT_TRUE_VALUE] : 0);
+
+        return $this->output($result, $outputStream);
     }
 
     public function encodeInteger(Integer $data, OutputStream $outputStream = null)
     {
         $bytes = $this->getIntegerBytes($data->getValue());
+        $result = $this->encodeIdentifierFromType($data)
+                . call_user_func_array('pack', array_merge(['C*', count($bytes)], $bytes));
 
-        return $this->output(
-            $this->encodeIdentifierFromType($data) . call_user_func_array('pack', array_merge(['C*', count($bytes)], $bytes)),
-            $outputStream
-        );
+        return $this->output($result, $outputStream);
+    }
+
+    public function encodeReal(Real $data, OutputStream $outputStream = null)
+    {
+        $value = $data->getValue();
+
+        if ($value == 0) {
+            $result = "\x00";
+        } else {
+            $value = (string) $value;
+            $result = $this->encodeDefiniteLength(strlen($value)) . $value;
+        }
+
+        return $this->output($this->encodeIdentifierFromType($data) . $result, $outputStream);
+    }
+
+    public function encodeNull(Null $data, OutputStream $outputStream = null)
+    {
+        return $this->output($this->encodeIdentifierFromType($data) . "\x00", $outputStream);
     }
 
     public function encodeOctetString(OctetString $data, OutputStream $outputStream = null)
     {
-        if ($string->isConstructed() && !$this->options[self::OPT_FORCE_DEFINITE_LENGTH]) {
-            $result = $this->encodeIdentifierFromType($data);
+        if ($outputStream && $data->isConstructed() && !$this->options[self::OPT_FORCE_DEFINITE_LENGTH]) {
+            $outputStream->write($this->encodeIdentifierFromType($data) . "\x80");
 
             while ($data->hasMore()) {
                 $raw = $data->getChunk();
 
-                $chunk = $this->encodeIdentifier(Type::CLASS_UNIVERSAL, false, 4)
-                       . $this->encodeDefiniteLength(strlen($raw))
-                       . $raw;
-
-                $this->output($chunk, $outputStream, $result);
+                $outputStream->write(
+                    $this->encodeIdentifier(Type::CLASS_UNIVERSAL, false, 4)
+                  . $this->encodeDefiniteLength(strlen($raw))
+                  . $raw
+                );
             }
 
-            $this->output("\x00\x00", $outputStream, $result);
+            $outputStream->write("\x00\x00");
         } else {
             $raw = '';
             while ($data->hasMore()) {
                 $raw .= $data->getChunk();
             }
 
-            $result = $this->encodeIdentifierFromType($data);
+            $result = $this->encodeIdentifier($data->getClass(), false, $data->getNumber());
                     . $this->encodeDefiniteLength(strlen($raw))
                     . $raw;
 
-            $this->output($result, $outputStream);
+            return $this->output($result, $outputStream);
         }
-
-        return $result;
-    }
-
-    public function encodeNull(Null $data, OutputStream $outputStream = null)
-    {
-        return $this->output(
-            $this->encodeIdentifierFromType($data) . "\x00",
-            $outputStream
-        );
     }
 
     public function encodeSequence(Sequence $data, OutputStream $outputStream = null)
     {
-        return $this->output(
-            $this->encodeIdentifierFromType($data) . "\x00",
-            $outputStream
-        );
+        return $this->encodeCollection($data, $outputStream);
+    }
+
+    public function encodeSet(Set $data, OutputStream $outputStream = null)
+    {
+        return $this->encodeCollection($data, $outputStream);
     }
 }
 
